@@ -25,6 +25,7 @@ $WebEmail
 $StaticBufferSize
 /;
 
+sub DEBUG() {0};
 
 $RequestTally = 0;
 $StaticBufferSize ||= 50000;
@@ -34,6 +35,7 @@ my $fn;
 # arrays indexed by $fn
 my @Listeners;    # handles to listening sockets
 my @PortNo;       # listening port numbers indexed by $fn
+my @PeerAddr;     # PEER_ADDR
 my @Clients;      # handles to client sockets
 my @inbuf;        # buffered information read from clients
 my @outbuf;       # buffered information for writing to clients
@@ -41,11 +43,12 @@ my @LargeFile;    # handles to large files being read, indexed by
                   # $fn of the client they are being read for
 my @continue;     # is there a continuation defined for this fn?
 my @poll;         # do we know how to poll a continuation for readiness?
+my @PostData;     # data for POST-style requests
 
 #lists of file numbers
 my @PollMe;       #continuation functions associated with empth output buffers
 
-$VERSION = '0.04';
+$VERSION = '0.05';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -76,6 +79,11 @@ BEGIN{
 	   eval'sub BROKEN_NONBLOCKING(){0}';
         };
 }
+
+sub makeref($){
+	ref($_[0]) ? $_[0] : \$_[0]
+};
+
 sub import(){
 
   print __PACKAGE__," import called\n";
@@ -84,6 +92,10 @@ sub import(){
 
   # DYNAMIC RECONFIGURATION SECTION
   my %args = @_;
+  DEBUG and do{
+	print "$_ is $args{$_}\n" foreach sort keys %args
+
+  };
   exists $args{port} and *Port = $args{port};
   exists $args{timeout} and *Timeout = $args{timeout};
   exists $args{maxclients} and *MaxClients = $args{maxclients};
@@ -91,6 +103,7 @@ sub import(){
   exists $args{function} and *Function = $args{function};
   exists $args{cgibin} and *CgiBin = $args{cgibin};
   exists $args{servertype} and *ServerType = $args{servertype};
+  exists $args{webemail} and *WebEmail = makeref($args{webemail});
   exists $args{path} and *Path = $args{path};
 
   @Port or die __PACKAGE__." invoked with empty \@Port array";
@@ -221,8 +234,13 @@ sub dispatch(){
 # return a numeric resultcode in $ResultCode
 # and data in $Data
 
+   if(DEBUG){
+     print "Request:\n${_}END_REQUEST\n";
+   };
+
    # defaults:
-   @_{qw/Data ResultCode/}=(undef,200);
+   %_=(Data => undef,
+       ResultCode => 200);
 
    # rfc2616 section 5.1
    /^(\w+) (\S+) HTTP\/(\S+)\s*(.*)$CRLF$CRLF/s
@@ -236,17 +254,35 @@ match the perl regex
 
 EOF
    };
-   @_{qw/Method URI HTTPver RequestHeader/} = ($1,$2,$3,$4);
+   @_{qw/
+      REQUEST_METHOD REQUEST_URI HTTPver RequestHeader
+      REMOTE_ADDR/
+   } = (
+      $1,$2,$3,$4,
+      $PeerAddr[$fn], 
+   );
+   if(DEBUG){for( sort keys %_ ){
+      print "$_ is $_{$_}\n";
+   }};
 
-   @_{qw/URIpath QUERY_STRING/} = $_{URI}=~m#(/[^\?]*)\??(.*)$#;
-   $_{URIpath} =~ s/%(..)/chr hex $1/ge; # RFC2616 sec. 3.2
-   my @URIpath = split '/',$_{URIpath}; 
+   # REQUEST_URI is
+   # equivalent to SCRIPT_NAME . PATH_INFO . '?' . QUERY_STRING
+
+   my $shortURI;
+   ($shortURI ,$_{QUERY_STRING}) = $_{REQUEST_URI}=~m#(/[^\?]*)\??(.*)$#;
+   $shortURI =~ s/%(..)/chr hex $1/ge; # RFC2616 sec. 3.2
+   if (uc($_{REQUEST_METHOD}) eq 'POST'){
+      $_{POST_DATA} = $PostData[$fn];
+   };
+
+   my @URIpath = split '/',$shortURI,-1; 
    my @Castoffs;
    my $mypath;
    while (@URIpath){
-      $mypath = join '/',@URIpath,'';
-      # print "considering $mypath\n";
+      $mypath = join '/',@URIpath;
+      DEBUG and print "considering $mypath\n";
       if (exists $Path{$mypath}){
+         $_{SCRIPT_NAME} = $mypath;
          print "PATH $mypath is $Path{$mypath}";
          $_{PATH_INFO} = join '/', @Castoffs;
          print " and PATH_INFO is $_{PATH_INFO}\n";
@@ -321,7 +357,11 @@ $_
 
 EOF
       };
-      unshift @Castoffs, pop @URIpath;
+      if((length $URIpath[$#URIpath]) > 0){
+         unshift @Castoffs, pop @URIpath;
+      }else{
+         $URIpath[$#URIpath] = '/'
+      };
    };
 
 
@@ -335,7 +375,9 @@ apparently this Singlethreaded server does not
 have a default handler installed at its 
 virtual root.
 
-Responsible person: $WebEmail
+Castoffs: [@Castoffs]
+
+Responsible person: [$WebEmail]
 
 $_
 
@@ -351,6 +393,7 @@ sub HandleRequest(){
    *_ = \delete $inbuf[$fn]; # tight, huh?
    
    my $dispatchretval = dispatch;
+   $dispatchretval or return undef;
    if($_{Data}){
    $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
 HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
@@ -443,6 +486,7 @@ sub Serve(){
    # accept new connections
    if($Accepting){
       for(@Listeners){
+         my $paddr;
          vec($rout,fileno($_),1) or next;
          # relies on listeners being nonblocking
          # thanks, thecap
@@ -450,7 +494,8 @@ sub Serve(){
          if (BROKEN_NONBLOCKING){ # this is a constant so the unused one
                                   # will be optimized away
           acc:
-          if (accept(my $NewServer, $_)){
+          $paddr=accept(my $NewServer, $_);
+          if ($paddr){
             $fn =fileno($NewServer); 
             $inbuf[$fn] = $outbuf[$fn] = '';
             print "Accepted $NewServer (",
@@ -458,6 +503,11 @@ sub Serve(){
                   ++$client_tally,
                   "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
             push @Clients, $NewServer;
+
+               my($port,$iaddr) = sockaddr_in($paddr);
+               # $PeerAddr[$fn] = gethostbyaddr($iaddr,AF_INET);
+               $PeerAddr[$fn] = inet_ntoa($iaddr);
+
           }
           # select again to see if there's another
           # client enqueued on $_
@@ -467,7 +517,7 @@ sub Serve(){
           vec($rvec,fileno($_),1) and goto acc;
       
          }else{
-          while (accept(my $NewServer, $_)){
+          while ($paddr=accept(my $NewServer, $_)){
             $fn =fileno($NewServer); 
             $inbuf[$fn] = $outbuf[$fn] = '';
             print "Accepted $NewServer (",
@@ -475,6 +525,10 @@ sub Serve(){
                   ++$client_tally,
                   "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
             push @Clients, $NewServer;
+
+               my($port,$iaddr) = sockaddr_in($paddr);
+               # $PeerAddr[$fn] = gethostbyaddr($iaddr,AF_INET);
+               $PeerAddr[$fn] = inet_ntoa($iaddr);
           }
          }
       }
@@ -539,11 +593,28 @@ sub Serve(){
          my $char;
          sysread $_,$char,64000;
 	 if(length $char){
+                DEBUG and print "$fn: read [$char]\n";
 		$inbuf[$fn] .= $char;
-                # CompleteRequest
-                substr($inbuf[$fn],-4,4) eq "\015\012\015\012"
-                 and
+                # CompleteRequest or not?
+                if($inbuf[$fn] =~
+/^POST .*?Content-Length: ?(\d+)[\015\012]+(.*)$/is){
+                   DEBUG and print "posting $1 bytes\n";
+                   if(length $2 >= $1){
+                      push @CompleteRequests, $fn;
+                      $PostData[$fn] = $2;
+                   }else{
+                      if(DEBUG){
+                       print "$fn: Waiting for $1 octets of POST data\n";
+                       print "$fn: only have ",length($2),"\n";
+                      }
+                   }
+		}elsif(substr($inbuf[$fn],-4,4) eq "\015\012\015\012"){
                    push @CompleteRequests, $fn;
+                }elsif(DEBUG){
+                   print "Waiting for request completion. So far have\n[",
+                   $inbuf[$fn],"]\n";
+
+                };   
 	 }else{
             print "Received empty packet on $_ ($fn)\n";
 		 print "CLOSING fd $fn\n";
@@ -928,6 +999,10 @@ Large files are now read in pieces instead of being slurped whole.
 
 Support for continuations for page generating functions is in place.
 
+=item 0.05
+
+Support for POST data is in place. POST data appears in C<$_{POST_DATA}>.
+Other CGI variables now available in C<%_> include PATH_INFO, QUERY_STRING, REMOTE_ADDR, REQUEST_METHOD, REQUEST_URI and SCRIPT_NAME.
 
 =back
 
