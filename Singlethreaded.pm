@@ -36,7 +36,7 @@ my @inbuf;
 my @outbuf;
 my @PortNo;
 
-$VERSION = '0.01';
+$VERSION = '0.02';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -51,7 +51,21 @@ keys(%MimeType ) or
 sub Serve();
 # use IO::Socket::INET;
 use Socket  qw(:DEFAULT :crlf);
-use Fcntl;
+BEGIN{
+	use Fcntl;
+        # determine if O_NONBLOCK works
+        # for use in fcntl($l, F_SETFL, O_NONBLOCK) 
+        eval{
+          print "O_NONBLOCK is ",O_NONBLOCK,
+                " and F_SETFL is ",F_SETFL,"\n";
+        };
+        if ($@){
+           print "O_NONBLOCK is broken, but a workaround is in place.\n";
+	   eval'sub BROKEN_NONBLOCKING(){1}';
+        }else{
+	   eval'sub BROKEN_NONBLOCKING(){0}';
+        };
+}
 sub import(){
 
   print __PACKAGE__," import called\n";
@@ -76,8 +90,10 @@ sub import(){
      my $l;
      socket($l, PF_INET, SOCK_STREAM,getprotobyname('tcp'))
         || die "socket: $!";
-     fcntl($l, F_SETFL, O_NONBLOCK) 
+     unless (BROKEN_NONBLOCKING){
+       fcntl($l, F_SETFL, O_NONBLOCK) 
         || die "can't set non blocking: $!";
+     };
      setsockopt($l, SOL_SOCKET,
                 SO_REUSEADDR,
                 pack("l", 1))
@@ -373,8 +389,9 @@ sub Serve(){
          # relies on listeners being nonblocking
          # thanks, thecap
          # (at http://www.perlmonks.org/index.pl?node_id=6535)
-         while (accept(my $NewServer, $_)){
-         # if (accept(my $NewServer, $_)){
+         if (BROKEN_NONBLOCKING){ # this is a constant so the unused one
+                                  # will be optimized away
+          if (accept(my $NewServer, $_)){
             $fn =fileno($NewServer); 
             $inbuf[$fn] = $outbuf[$fn] = '';
             print "Accepted $NewServer (",
@@ -382,6 +399,17 @@ sub Serve(){
                   ++$client_tally,
                   "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
             push @Clients, $NewServer;
+          }
+         }else{
+          while (accept(my $NewServer, $_)){
+            $fn =fileno($NewServer); 
+            $inbuf[$fn] = $outbuf[$fn] = '';
+            print "Accepted $NewServer (",
+                  $fn,") ",
+                  ++$client_tally,
+                  "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
+            push @Clients, $NewServer;
+          }
          }
       }
    } # if accepting connections
@@ -653,7 +681,14 @@ of simultaneous HTTP requests.
 
 =item 0.01
 
-August 18, 2004.  %CgiBin is not yet implemented.
+August 18-22, 2004.  %CgiBin is not yet implemented.
+
+=item 0.02
+
+August 22, 2004.  Nonblocking sockets apparently just
+plain don't exist on Microsoft Windows, so on that platform
+we can only add one new client from each listener on each
+call to serve.
 
 =back
 

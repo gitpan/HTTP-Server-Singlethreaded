@@ -1,7 +1,13 @@
 HTTP/Server/Singlethreaded version 0.01
 ==================================
 A single-threaded HTTP server suitable for building
-stand-alone web applications around.
+stand-alone web applications around. On systems without
+working non-blocking listening sockets, we can only
+accept one new client per select interation, and the
+module figures out what is available and uses does single
+or multiple accept calls depending on the platform.
+
+Tested under glibc linux and activestate on win2000.
 
 This version is still very early, but the following command
 line is able to produce a server on port 8000 that exports
