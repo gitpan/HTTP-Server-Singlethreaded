@@ -22,21 +22,30 @@ $VERSION
 $RequestTally
 $uid $gid $forkwidth @kids
 $WebEmail
+$StaticBufferSize
 /;
 
 
 $RequestTally = 0;
+$StaticBufferSize ||= 50000;
 
 # file number of request
 my $fn;
 # arrays indexed by $fn
-my @Listeners;
-my @Clients;
-my @inbuf;
-my @outbuf;
-my @PortNo;
+my @Listeners;    # handles to listening sockets
+my @PortNo;       # listening port numbers indexed by $fn
+my @Clients;      # handles to client sockets
+my @inbuf;        # buffered information read from clients
+my @outbuf;       # buffered information for writing to clients
+my @LargeFile;    # handles to large files being read, indexed by
+                  # $fn of the client they are being read for
+my @continue;     # is there a continuation defined for this fn?
+my @poll;         # do we know how to poll a continuation for readiness?
 
-$VERSION = '0.02';
+#lists of file numbers
+my @PollMe;       #continuation functions associated with empth output buffers
+
+$VERSION = '0.04';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -56,11 +65,12 @@ BEGIN{
         # determine if O_NONBLOCK works
         # for use in fcntl($l, F_SETFL, O_NONBLOCK) 
         eval{
-          print "O_NONBLOCK is ",O_NONBLOCK,
-                " and F_SETFL is ",F_SETFL,"\n";
+          # print "O_NONBLOCK is ",O_NONBLOCK,
+          #      " and F_SETFL is ",F_SETFL,"\n";
+          O_NONBLOCK; F_SETFL;
         };
         if ($@){
-           print "O_NONBLOCK is broken, but a workaround is in place.\n";
+           # print "O_NONBLOCK is broken, but a workaround is in place.\n";
 	   eval'sub BROKEN_NONBLOCKING(){1}';
         }else{
 	   eval'sub BROKEN_NONBLOCKING(){0}';
@@ -151,6 +161,7 @@ sub import(){
    }
 
    {
+      # import Serve into caller's package
       no strict;
       *{caller().'::Serve'} = \&Serve;
    }
@@ -227,18 +238,18 @@ EOF
    };
    @_{qw/Method URI HTTPver RequestHeader/} = ($1,$2,$3,$4);
 
-   @_{qw/URIpath QUERY_STRING/} = $_{URI}=~m#(/[^\?]*)\??(.*)#;
+   @_{qw/URIpath QUERY_STRING/} = $_{URI}=~m#(/[^\?]*)\??(.*)$#;
    $_{URIpath} =~ s/%(..)/chr hex $1/ge; # RFC2616 sec. 3.2
    my @URIpath = split '/',$_{URIpath}; 
    my @Castoffs;
    my $mypath;
    while (@URIpath){
       $mypath = join '/',@URIpath,'';
-      print "considering $mypath\n";
+      # print "considering $mypath\n";
       if (exists $Path{$mypath}){
-         print "$mypath => $Path{$mypath}\n";
+         print "PATH $mypath is $Path{$mypath}";
          $_{PATH_INFO} = join '/', @Castoffs;
-         print "PATH_INFO is $_{PATH_INFO}\n";
+         print " and PATH_INFO is $_{PATH_INFO}\n";
          if (ref $Path{$mypath}){
             my $DynPage;
             eval {
@@ -256,13 +267,14 @@ $@
 EOF
          };
          if ($Path{$mypath} =~/^STATIC (.+)/){
+            my $FILE;
             my $filename = "$1/$_{PATH_INFO}";
             print "filename: $filename\n";
             $filename =~ s/\/\.\.\//\//g; # no ../../ attacks
             my ($ext) = $filename =~ /\.(\w+)$/;
             my $ContentType = $MimeType{$ext}||$DefaultMimeType;
             # unless (-f $filename and -r _ ){
-            unless(open FILE, "<", $filename){
+            unless(open $FILE, "<", $filename){
                $_{ResultCode} = 404;
                return <<EOF;
 Content-type: text/plain
@@ -279,7 +291,14 @@ $_
 EOF
             };
             # range will go here when supported
-            sysread FILE, my $slurp, -s $filename;
+            my $size = -s $filename;
+            my $slurp;
+            my $read = sysread $FILE, $slurp, $StaticBufferSize ;
+
+            if ($read < $size){
+               $LargeFile[$fn] = $FILE;
+            };
+
             return "Content-type: $ContentType\n\n$slurp";
 
          };
@@ -332,16 +351,34 @@ sub HandleRequest(){
    *_ = \delete $inbuf[$fn]; # tight, huh?
    
    my $dispatchretval = dispatch;
-   $_{Data} ||= $dispatchretval;
+   if($_{Data}){
    $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
 HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
 Server: $ServerType
 $_{Data}
 EOF
+   };
+   if(ref($dispatchretval)){
+      my ($poll, $continue);
+      if(ref($dispatchretval) eq 'ARRAY'){
+         ($continue,$poll) = @{$dispatchretval}
+      }elsif(ref($dispatchretval) eq 'HASH'){
+         ($poll, $continue) = @{$dispatchretval}{qw/poll continue/}
+      }else{
+         die "I do not understand what to do with <<$dispatchretval>> here";
+      }
+      ref($poll) eq 'CODE' and $poll[$fn] = $poll;
+      ref($continue) eq 'CODE' or die
+         die "I do not understand what to do with <<$continue>> here";
+      $continue[$fn] = $continue;
 
-  # is this necessary?
-  $outbuf[$fn] =~ s/$CR//g; 
-  $outbuf[$fn] =~ s/$LF/$CRLF/g; 
+   }else{
+         $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
+HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
+Server: $ServerType
+$dispatchretval
+EOF
+   }
 
 };
 
@@ -351,6 +388,27 @@ sub Serve(){
    my ($rin,$win,$ein,$rout,$wout,$eout);
    my $nfound;
 
+  # support for continuation coderefs to empty outbufs
+  {
+   my @PM;
+   for $fn (@PollMe){
+         if(
+           defined($continue[$fn])
+         ){
+           if (defined $poll[$fn] and !&{$poll[$fn]}){
+              push @PM, $fn;
+              next;
+           };
+           $_{Data} = '';
+           ($continue[$fn],$poll[$fn]) = &{$continue[$fn]};
+           length( $outbuf[$fn] = $_{Data} )
+              or push @PM, $fn;
+         }
+   };
+
+   @PollMe = @PM;
+
+  };
 
    # poll for new connections?
    my $Accepting = ($client_tally < $MaxClients);
@@ -391,6 +449,7 @@ sub Serve(){
          # (at http://www.perlmonks.org/index.pl?node_id=6535)
          if (BROKEN_NONBLOCKING){ # this is a constant so the unused one
                                   # will be optimized away
+          acc:
           if (accept(my $NewServer, $_)){
             $fn =fileno($NewServer); 
             $inbuf[$fn] = $outbuf[$fn] = '';
@@ -400,6 +459,13 @@ sub Serve(){
                   "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
             push @Clients, $NewServer;
           }
+          # select again to see if there's another
+          # client enqueued on $_
+          my $rvec;
+          vec($rvec,fileno($_),1) = 1;
+          select($rvec,undef,undef,0);
+          vec($rvec,fileno($_),1) and goto acc;
+      
          }else{
           while (accept(my $NewServer, $_)){
             $fn =fileno($NewServer); 
@@ -420,8 +486,46 @@ sub Serve(){
       $fn = fileno($_);
       vec($wout,$fn,1) or next;
       $wlen = syswrite $_, $outbuf[$fn], length($outbuf[$fn]);
-      defined $wlen or print "Error on socket $_ ($fn): $!\n";
-      substr $outbuf[$fn], 0, $wlen, '';
+      if(defined $wlen){
+        print "wrote $wlen of ",length($outbuf[$fn])," to ($fn)\n";
+        substr $outbuf[$fn], 0, $wlen, '';
+      
+        # support for chunking large files (not HTTP1.1 chunking, just
+        # reading as we go
+        if(
+           length($outbuf[$fn]) < $StaticBufferSize
+        ){
+         if(
+           defined($LargeFile[$fn])
+         ){
+             my $slurp;
+             my $read = sysread $LargeFile[$fn], $slurp, $StaticBufferSize ;
+             # zero for EOF and undef on error
+             if ($read){
+               $outbuf[$fn].= $slurp; 
+             }else{
+                print "sysread error: $!" unless defined $read;
+                delete $LargeFile[$fn];
+             };
+            };
+         # support for continuation coderefs
+         }elsif(
+           defined($continue[$fn])
+         ){
+           if (defined $poll[$fn] and !&{$poll[$fn]}){
+              length ($outbuf[$fn]) or push @PollMe, $fn;
+              next;
+           };
+           ($continue[$fn],$poll[$fn]) = &{$continue[$fn]};
+           $outbuf[$fn] .= $_{Data};
+           length ($outbuf[$fn]) or push @PollMe, $fn;
+           next;
+         };
+      }else{
+         print "Error writing to socket $_ ($fn): $!\n";
+         $outbuf[$fn] = '';
+      }
+
       # rewrite this when adding keepalive support
       length($outbuf[$fn]) or close $_;
    }
@@ -516,7 +620,15 @@ HTTP::Server::Singlethreaded - a framework for standalone web applications
   #
   }; # end BEGIN
   # merge path config and open listening sockets
-  use HTTP::Server::Singlethreaded;
+  # configuration can also be provided in Use line.
+  use HTTP::Server::Singlethreaded
+     timeout => \$NotSetToAnythingForFullBlocking,
+     function => { # must be a hash ref
+                    '/time/' => sub {
+                       "Content-type: text/plain\n\n".localtime
+                    }
+     },
+     path => \%ChangeConfigurationWhileServingBySettingThis;
   #
   # "top level select loop" is invoked explicitly
   for(;;){
@@ -526,6 +638,9 @@ HTTP::Server::Singlethreaded - a framework for standalone web applications
        ...
        $lasttime = time;
     };
+    # Auto restart on editing this file
+    BEGIN{$OriginalM = -M $0}
+    exec "perl -w $0" if -M $0 != $OriginalM;
     #
     # do pending IO, invoke functions, read statics
     # HTTP::Server::Singlethreaded::Serve()
@@ -547,15 +662,27 @@ handle just the domain name, or a get request for /.
 the %Static hash contains paths to directories where files can be found
 for serving static files.
 
+=head3 $StaticBufferSize
+
+How much of a large file do we read in at once?  Without memory 
+mapping, we have to read in files, and then write them out. Files larger
+than this will get this much read from them when the output buffer is
+smaller than this size.  Defaults to 50000 bytes, so output buffers
+for a request should fluctuate between zero and 100000 bytes while
+serving a large file.
+
 =head2 %Function
-Paths to functions => functions to run.  Functions should take exactly one
-argument, which will be the entire server request.
+
+Paths to functions => functions to run.  The entire server request is
+available in C<$_> and several variables are available in C<%_>.  C<$_{PATH_INFO}>,C<$_{QUERY_STRING}> are of interest. The whole standard CGI environment
+will eventually appear in C<%_> for use by functions but it does not yet.
 
 =head2 %CgiBin
 
-CgiBin is a functional wrapper that forks and executes a named executable program,
-after setting the common gateway interface environment variables and changing
-directory to the listed directory. NOT IMPLEMENTED IN THIS VERSION
+CgiBin is a functional wrapper that forks and executes a named
+executable program, after setting the common gateway interface
+environment variables and changing
+directory to the listed directory. NOT IMPLEMENTED YET
 
 =head2 @Port
 
@@ -565,17 +692,42 @@ the C<@Port> array lists the ports the server tries to listen on.
 
 not implemented yet; a few configuration interfaces are possible,
 most likely a hash of host names that map to strings that will be
-prepeneded to the key looked up in %Path.
+prepeneded to the key looked up in %Path, something like
+
+   use HTTP::Server::Singlethreaded 
+      vhost => {
+         'perl.org' => perl =>
+         'www.perl.org' => perl =>
+         'web.perl.org' => perl =>
+         'example.org' => exmpl =>
+         'example.com' => exmpl =>
+         'example.net' => exmpl =>
+         'www.example.org' => exmpl =>
+         'www.example.com' => exmpl =>
+         'www.example.net' => exmpl =>
+      },
+      static => {
+         '/' => '/var/web/htdocs/',
+         'perl/' => '/var/vhosts/perl/htdocs',
+         'exmpl/' => '/var/vhosts/example/htdocs'
+      }
+   ;
+
+Please submit comments via rt.cpan.org.
 
 =head2 $Timeout
 
-the timeout for the select 
+the timeout for the select.  C<0> will cause C<Serve> to simply poll.
+C<undef>, to cause Serve to block until thereis a connection, can only
+be passed on the C<use> line.
 
 =head2 $MaxClients
 
 if we have more active clients than this we won't accept more. Since
 we're not respecting keepalive at this time, this number indicates
-how long of a backlog singlethreaded will maintain at any moment.
+how long of a backlog singlethreaded will maintain at any moment,and
+should be orders of magnitude lower than the number of simultaneous
+web page viewers possible. Depending on how long your functions take.
 
 =head2 $WebEmail
 
@@ -593,7 +745,9 @@ is altered to indicate which process we are in, such as
 the children in @kids, as well as a $forkwidth variable that
 matches C</(\d+) of \1/>. Also, all children are sent a TERM
 signal from the parent process's END block.  Uncomment the
-relevant lines if you need this.
+relevant lines in the module source if you need this. Forking after
+initializing the module should work too.  This might get removed
+as an example of featureitis.
 
 =head2 $uid and $gid
 
@@ -605,16 +759,16 @@ are bound.
 
 Dynamic reconfiguration is possible, either by directly altering
 the configuration variables or by passing references to import().
-If you can't see how to do this from looking at the source, an
-attempted explanation here would probably just waste your time.
 
 =head1 Action Selection Method
 
 The request is split on slashes, then matched against the configuration
-hashes until there is a match.  Longer matching pieces trump shorter ones.
+hash until there is a match.  Longer matching pieces trump shorter ones.
 
-Having the same path listed in more than one of %Static, %Functions, or %CgiBin is
-an error and the server will not start in that case. 
+Having the same path listed in more than one of C<%Static>,
+C<%Functions>, or C<%CgiBin> is
+an error and the server will not start in that case. It will die
+while constructing C<%Path>.
 
 =head1 Writing Functions For Use With HTTP::Server::Singlethreaded
 
@@ -656,6 +810,10 @@ C<$_{ResultCode}> defaults to 200 on success and gets set to 500
 when your function dies.  C<$@> will be included in the output.
 Singlethreaded knows all the result code strings defined in RFC2616.
 
+As of late 2004, Mozilla FireFox will show you error messages while
+Microsoft Internet Explorer hides error messages from its users, at
+least with the default configuration.
+
 =head3 Data
 
 Store your complete web page output into C<$_{Data}>, just as you
@@ -663,17 +821,81 @@ would write output starting with server headers when writing
 a simple CGI program. Or leave $_{Data} alone and return a valid
 page, beginning with headers.
 
-
 =head1 AVOIDING DEADLOCKS
 
-The server blocks while slurping files and executing functions, at this
-version. So singlethreaded is not appropriate for serving large files.
+The server blocks while reading files and executing functions.
+
+=head2 avoiding waiting  with callbacks
+
+A way 
+for a function to return immediately and specify a callback.
+
+Instead of a string to send to the client, the function 
+returns a coderef to indicate
+that Singlethreaded needs to check back later to see if the page
+is ready, by running the coderef, next time around.  Data for
+the client, if any, must be stored in C<$_{Data}>.
+
+
+Instead of a coderef, a hashref or an arrayref is acceptable.
+The hashref needs to have 'continue' defined within it as a coderef.,
+and may have 'poll' defined in it when it makes sense to have 
+separate poll and continue coderefs.
+
+=head3 poll
+
+a reference to code that will return a boolean indicating true when it is time
+to run the continue piece and get some data, or false when we should wait
+some more before running the continuation.
+
+=head3 continue
+
+a coderef that, when run, will set $_{Data} with an empty or non-empty
+string, and return a (contine, [poll]) list. 
+
+=head2 an arrayref instead of a hashref
+
+in the order of, C<[$continue, $poll]> so the later one
+can be left out if there is no poll code.
+
+=head2 example
+
+Lets say we have two functions called C<Start()> and C<More($)> that
+we are wrapping as a web service with Singlethreaded. C<Start> returns
+a handle that is passed as an argument to C<More> to prevent instance
+confusion.  C<More> will
+return either some data or emptystring or undef when it is done.  Here's
+how to wrap them:
+
+   sub StartMoreWrapper{
+      my $handle = Start or die "Start() failed";
+      my $con;
+      $_{Data} = <<EOF;
+   Content-type: text/plain
+
+   Here are the results from More:
+   EOF
+
+      $con = sub{
+         my $rv = More($handle);
+         if(defined $rv){
+              $_{Data} = $rv;
+              return ($con);
+         };
+         ();
+      }
+   }
+
+And be sure to put C<'/startrestults/' => \&StartMoreWrapper> into the
+functions hash.
+
+
 
 =head1 What Singlethreaded is good for
 
 Singlethreaded is designed to provide a web interface to a database,
 leveraging a single persistent DBI handle into an unlimited number
-of simultaneous HTTP requests.
+of simultaneous HTTP requests.  
 
 =head1 HISTORY
 
@@ -688,7 +910,24 @@ August 18-22, 2004.  %CgiBin is not yet implemented.
 August 22, 2004.  Nonblocking sockets apparently just
 plain don't exist on Microsoft Windows, so on that platform
 we can only add one new client from each listener on each
-call to serve.
+call to serve. Which should make no difference at all. At least
+not noticeable. The connection time will be longer for some of
+the clients in a burst of simultaneous connections.  Writing
+around this would not be hard: another select loop that only
+cares about the Listeners would do it.
+
+=item 0.03
+
+The listen queue will now be drained until empty on platforms
+without nonblocking listen sockets thanks to a second C<select>
+call.
+
+Large files are now read in pieces instead of being slurped whole.
+
+=item 0.04
+
+Support for continuations for page generating functions is in place.
+
 
 =back
 
