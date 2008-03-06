@@ -48,7 +48,7 @@ my @PostData;     # data for POST-style requests
 #lists of file numbers
 my @PollMe;       #continuation functions associated with empth output buffers
 
-$VERSION = '0.05';
+$VERSION = '0.06';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -419,8 +419,8 @@ EOF
          $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
 HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
 Server: $ServerType
-$dispatchretval
 EOF
+	$outbuf[$fn].=$dispatchretval
    }
 
 };
@@ -968,6 +968,8 @@ Singlethreaded is designed to provide a web interface to a database,
 leveraging a single persistent DBI handle into an unlimited number
 of simultaneous HTTP requests.  
 
+It will work to serve a mini-cpan repository.
+
 =head1 HISTORY
 
 =over 8
@@ -1003,6 +1005,12 @@ Support for continuations for page generating functions is in place.
 
 Support for POST data is in place. POST data appears in C<$_{POST_DATA}>.
 Other CGI variables now available in C<%_> include PATH_INFO, QUERY_STRING, REMOTE_ADDR, REQUEST_METHOD, REQUEST_URI and SCRIPT_NAME.
+
+=item 0.06
+
+Fixed a bug with serving files larger than the chunksize, that inserted
+a gratuitous newline.  Singlethreaded will now work to serve a minicpan
+mirror.
 
 =back
 
