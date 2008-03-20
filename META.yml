@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                HTTP-Server-Singlethreaded
-version:             0.06
+version:             0.08
 abstract:            a framework for standalone web applications
 license:             ~
 author:              

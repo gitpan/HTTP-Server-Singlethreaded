@@ -23,6 +23,10 @@ $RequestTally
 $uid $gid $forkwidth @kids
 $WebEmail
 $StaticBufferSize
+@Cport
+@Caddr
+@Sport
+@Saddr
 /;
 
 sub DEBUG() {0};
@@ -35,7 +39,6 @@ my $fn;
 # arrays indexed by $fn
 my @Listeners;    # handles to listening sockets
 my @PortNo;       # listening port numbers indexed by $fn
-my @PeerAddr;     # PEER_ADDR
 my @Clients;      # handles to client sockets
 my @inbuf;        # buffered information read from clients
 my @outbuf;       # buffered information for writing to clients
@@ -48,7 +51,7 @@ my @PostData;     # data for POST-style requests
 #lists of file numbers
 my @PollMe;       #continuation functions associated with empth output buffers
 
-$VERSION = '0.06';
+$VERSION = '0.08';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -256,10 +259,11 @@ EOF
    };
    @_{qw/
       REQUEST_METHOD REQUEST_URI HTTPver RequestHeader
-      REMOTE_ADDR/
+      REMOTE_ADDR REMOTE_PORT SERVER_ADDR SERVER_PORT/
    } = (
       $1,$2,$3,$4,
-      $PeerAddr[$fn], 
+      $Caddr[$fn], $Cport[$fn],
+      $Saddr[$fn], $Sport[$fn]
    );
    if(DEBUG){for( sort keys %_ ){
       print "$_ is $_{$_}\n";
@@ -491,46 +495,51 @@ sub Serve(){
          # relies on listeners being nonblocking
          # thanks, thecap
          # (at http://www.perlmonks.org/index.pl?node_id=6535)
-         if (BROKEN_NONBLOCKING){ # this is a constant so the unused one
-                                  # will be optimized away
-          acc:
-          $paddr=accept(my $NewServer, $_);
-          if ($paddr){
-            $fn =fileno($NewServer); 
-            $inbuf[$fn] = $outbuf[$fn] = '';
-            print "Accepted $NewServer (",
-                  $fn,") ",
-                  ++$client_tally,
-                  "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
-            push @Clients, $NewServer;
-
-               my($port,$iaddr) = sockaddr_in($paddr);
-               # $PeerAddr[$fn] = gethostbyaddr($iaddr,AF_INET);
-               $PeerAddr[$fn] = inet_ntoa($iaddr);
-
-          }
-          # select again to see if there's another
-          # client enqueued on $_
-          my $rvec;
-          vec($rvec,fileno($_),1) = 1;
-          select($rvec,undef,undef,0);
-          vec($rvec,fileno($_),1) and goto acc;
-      
-         }else{
+#BLAH         if (BROKEN_NONBLOCKING){ # this is a constant so the unused one
+#BLAH                                  # will be optimized away
+#BLAH          acc:
+#BLAH          $paddr=accept(my $NewServer, $_);
+#BLAH          if ($paddr){
+#BLAH            $fn =fileno($NewServer); 
+#BLAH	    ($Cport[$fn], my $iaddr) = sockaddr_in($paddr);
+#BLAH	    $Caddr[$fn] = inet_ntoa($iaddr);
+#BLAH            $inbuf[$fn] = $outbuf[$fn] = '';
+#BLAH            print "Accepted $NewServer (",
+#BLAH                  $fn,") ",
+#BLAH                  ++$client_tally,
+#BLAH                  "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
+#BLAH            push @Clients, $NewServer;
+#BLAH
+#BLAH
+#BLAH          }
+#BLAH
+#BLAH	  # select again to see if there's another
+#BLAH          # client enqueued on $_
+#BLAH          my $rvec;
+#BLAH          vec($rvec,fileno($_),1) = 1;
+#BLAH          select($rvec,undef,undef,0);
+#BLAH          vec($rvec,fileno($_),1) and goto acc;
+#BLAH      
+#BLAH         }else{  # WORKING NON_BLOCKING
           while ($paddr=accept(my $NewServer, $_)){
             $fn =fileno($NewServer); 
             $inbuf[$fn] = $outbuf[$fn] = '';
+	    ($Cport[$fn], my $iaddr) = sockaddr_in($paddr);
+	    $Caddr[$fn] = inet_ntoa($iaddr);
+
+	    my $mysockaddr = getsockname($NewServer);
+	    ($Sport[$fn], $iaddr) = sockaddr_in($mysockaddr);
+	    $Saddr[$fn] = inet_ntoa($iaddr);
+
             print "Accepted $NewServer (",
                   $fn,") ",
                   ++$client_tally,
                   "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
             push @Clients, $NewServer;
 
-               my($port,$iaddr) = sockaddr_in($paddr);
-               # $PeerAddr[$fn] = gethostbyaddr($iaddr,AF_INET);
-               $PeerAddr[$fn] = inet_ntoa($iaddr);
+	    BROKEN_NONBLOCKING and last;
           }
-         }
+#BLAH   }
       }
    } # if accepting connections
 
@@ -1011,6 +1020,10 @@ Other CGI variables now available in C<%_> include PATH_INFO, QUERY_STRING, REMO
 Fixed a bug with serving files larger than the chunksize, that inserted
 a gratuitous newline.  Singlethreaded will now work to serve a minicpan
 mirror.
+
+=item 0.08 
+
+address of this end of the connection now available
 
 =back
 
