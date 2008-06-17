@@ -1,5 +1,19 @@
 package HTTP::Server::Singlethreaded;
 
+BEGIN{
+	eval ( $ENV{OS}=~/win/i ? <<WIN : <<NOTWIN )
+
+	sub BROKENSYSWRITE(){1}
+
+WIN
+
+	sub BROKENSYSWRITE(){0}
+
+NOTWIN
+
+}
+
+
 use 5.006;
 use strict;
 use warnings;
@@ -49,9 +63,9 @@ my @poll;         # do we know how to poll a continuation for readiness?
 my @PostData;     # data for POST-style requests
 
 #lists of file numbers
-my @PollMe;       #continuation functions associated with empth output buffers
+my @PollMe;       #continuation functions associated with empty output buffers
 
-$VERSION = '0.08';
+$VERSION = '0.10';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -230,6 +244,7 @@ my %RCtext =(
 ); 
 
 
+our @Moustache;  # per-fn %_ references
 
 sub dispatch(){
 # based on the request, which is in $_,
@@ -242,8 +257,10 @@ sub dispatch(){
    };
 
    # defaults:
-   %_=(Data => undef,
-       ResultCode => 200);
+   *_ = $Moustache[$fn] = {
+       Data => undef,
+       ResultCode => 200
+   };
 
    # rfc2616 section 5.1
    /^(\w+) (\S+) HTTP\/(\S+)\s*(.*)$CRLF$CRLF/s
@@ -284,7 +301,7 @@ EOF
    my $mypath;
    while (@URIpath){
       $mypath = join '/',@URIpath;
-      DEBUG and print "considering $mypath\n";
+      DEBUG and warn "considering $mypath\n";
       if (exists $Path{$mypath}){
          $_{SCRIPT_NAME} = $mypath;
          print "PATH $mypath is $Path{$mypath}";
@@ -394,23 +411,32 @@ sub HandleRequest(){
    $RequestTally++;
    print "Handling request $RequestTally on fn $fn\n";
    # print "Inbuf:\n$inbuf[$fn]\n";
-   *_ = \delete $inbuf[$fn]; # tight, huh?
+   *_ = \delete $inbuf[$fn]; # tight, huh? (the scalar slot)
    
    my $dispatchretval = dispatch;
    $dispatchretval or return undef;
-   if($_{Data}){
    $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
 HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
 Server: $ServerType
-$_{Data}
 EOF
-   };
+   # *_ = $Moustache[$fn];  # also, the hash slot -- this is done in &dispatch, never mind
+   HandleDRV($dispatchretval);
+};
+sub HandleDRV{
+   our $PMflag;
+   my $dispatchretval = shift;
+   @_ and $dispatchretval = [$dispatchretval,shift]; # support old-style
+   $poll[$fn] = $continue[$fn] = undef;
+   length $_{Data} and $outbuf[$fn] .= $_{Data};
    if(ref($dispatchretval)){
+      $PMflag = 1;
       my ($poll, $continue);
       if(ref($dispatchretval) eq 'ARRAY'){
          ($continue,$poll) = @{$dispatchretval}
       }elsif(ref($dispatchretval) eq 'HASH'){
          ($poll, $continue) = @{$dispatchretval}{qw/poll continue/}
+      }elsif(ref($dispatchretval) eq 'CODE'){
+	 $continue = $dispatchretval;
       }else{
          die "I do not understand what to do with <<$dispatchretval>> here";
       }
@@ -420,10 +446,6 @@ EOF
       $continue[$fn] = $continue;
 
    }else{
-         $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
-HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
-Server: $ServerType
-EOF
 	$outbuf[$fn].=$dispatchretval
    }
 
@@ -431,25 +453,31 @@ EOF
 
 my $client_tally = 0;
 sub Serve(){
-   print "L: (@Listeners) C: (@Clients)\n";
+   DEBUG and print "L: (@Listeners) C: (@Clients)\n";
    my ($rin,$win,$ein,$rout,$wout,$eout);
    my $nfound;
+
+BEGIN_SERVICE:
 
   # support for continuation coderefs to empty outbufs
   {
    my @PM;
+   our $PMflag;
    for $fn (@PollMe){
+         warn "polling $fn";
          if(
            defined($continue[$fn])
          ){
-           if (defined $poll[$fn] and !&{$poll[$fn]}){
-              push @PM, $fn;
-              next;
+           if (defined $poll[$fn]){
+              &{$poll[$fn]} or do {
+                  push @PM, $fn;
+                  next;
+              }
            };
+           *_ = $Moustache[$fn]; # the hash slot 
            $_{Data} = '';
-           ($continue[$fn],$poll[$fn]) = &{$continue[$fn]};
-           length( $outbuf[$fn] = $_{Data} )
-              or push @PM, $fn;
+   	   HandleDRV( &{$continue[$fn]} );
+	   length $outbuf[$fn] or  push @PM, $fn;
          }
    };
 
@@ -487,6 +515,7 @@ sub Serve(){
    # Select.
    $nfound = select($rout=$rin, $wout=$win, $eout=$ein, $Timeout);
    $nfound > 0 or return;
+   my $Services = 0; # goes true when writing outbound bytes
    # accept new connections
    if($Accepting){
       for(@Listeners){
@@ -537,7 +566,7 @@ sub Serve(){
                   "/$MaxClients on $_ ($fn) port $PortNo[fileno($_)]\n";
             push @Clients, $NewServer;
 
-	    BROKEN_NONBLOCKING and last;
+	    BROKEN_NONBLOCKING and last; # much simpler
           }
 #BLAH   }
       }
@@ -545,20 +574,22 @@ sub Serve(){
 
    # Send outbound data from outbufs 
    my $wlen;
-   for(@Outs){
-      $fn = fileno($_);
-      vec($wout,$fn,1) or next;
-      $wlen = syswrite $_, $outbuf[$fn], length($outbuf[$fn]);
+   for my $OutFileHandle (@Outs){
+      $fn = fileno($OutFileHandle);
+      ((defined $fn) and vec($wout,$fn,1)) or next;
+         $Services++;
+      $wlen = syswrite $OutFileHandle, $outbuf[$fn], (BROKENSYSWRITE ? 1 : length($outbuf[$fn]));
       if(defined $wlen){
-        print "wrote $wlen of ",length($outbuf[$fn])," to ($fn)\n";
+        DEBUG and print "wrote $wlen of ",length($outbuf[$fn])," to ($fn)\n";
         substr $outbuf[$fn], 0, $wlen, '';
       
-        # support for chunking large files (not HTTP1.1 chunking, just
-        # reading as we go
         if(
            length($outbuf[$fn]) < $StaticBufferSize
         ){
+	 # then we would like to add some more to our outbuf
          if(
+           # support for chunking large files (not HTTP1.1 chunking, just
+           # reading as we go
            defined($LargeFile[$fn])
          ){
              my $slurp;
@@ -570,27 +601,28 @@ sub Serve(){
                 print "sysread error: $!" unless defined $read;
                 delete $LargeFile[$fn];
              };
-            };
-         # support for continuation coderefs
          }elsif(
+           # support for continuation coderefs
            defined($continue[$fn])
          ){
            if (defined $poll[$fn] and !&{$poll[$fn]}){
               length ($outbuf[$fn]) or push @PollMe, $fn;
               next;
            };
-           ($continue[$fn],$poll[$fn]) = &{$continue[$fn]};
-           $outbuf[$fn] .= $_{Data};
+           *_ = $Moustache[$fn]; # the hash slot 
+           $_{Data} = '';
+   	   HandleDRV( &{$continue[$fn]} );
            length ($outbuf[$fn]) or push @PollMe, $fn;
            next;
          };
+        }
       }else{
-         print "Error writing to socket $_ ($fn): $!\n";
+         warn "Error writing to socket $OutFileHandle ($fn): $!";
          $outbuf[$fn] = '';
       }
 
       # rewrite this when adding keepalive support
-      length($outbuf[$fn]) or close $_;
+      length($outbuf[$fn]) or close $OutFileHandle;
    }
 
    # read incoming data to inbufs and list inbufs with complete requests
@@ -644,7 +676,7 @@ sub Serve(){
 
    @Clients = grep { defined fileno($_) } @Clients;
    $client_tally = @Clients;
-   print "$client_tally / $MaxClients\n";
+   DEBUG and print "$client_tally / $MaxClients\n";
 
    # handle complete requests
    # (outbound data will get written next time)
@@ -654,6 +686,7 @@ sub Serve(){
 
    };
 
+   $Services and goto BEGIN_SERVICE; # keep selecting while we actually do something
 
 
 };
@@ -903,19 +936,21 @@ page, beginning with headers.
 
 =head1 AVOIDING DEADLOCKS
 
-The server blocks while reading files and executing functions.
+The server blocks while reading files and executing functions.  You may use a closure
+to describe a callback.  %_ is restored between callbacks while handling a request.
 
-=head2 avoiding waiting  with callbacks
-
-A way 
-for a function to return immediately and specify a callback.
+=head1 CALLBACK FUNCTIONS (and poll functions)
 
 Instead of a string to send to the client, the function 
 returns a coderef to indicate
 that Singlethreaded needs to check back later to see if the page
 is ready, by running the coderef, next time around.  Data for
-the client, if any, must be stored in C<$_{Data}>.
+the client, if any, must be stored in C<$_{Data}> when you want
+the callback to be called again (indicated by continuing to return
+the callback function.)
 
+When the callback function returns a non-reference, that string is
+considered the end of the response.
 
 Instead of a coderef, a hashref or an arrayref is acceptable.
 The hashref needs to have 'continue' defined within it as a coderef.,
@@ -950,11 +985,13 @@ how to wrap them:
    sub StartMoreWrapper{
       my $handle = Start or die "Start() failed";
       my $con;
-      $_{Data} = <<EOF;
-   Content-type: text/plain
+      $_{Data} = <<HEAD;
+   Content-type: text/html
 
+   <html><body bgcolor="FFFFFF">
    Here are the results from More:
-   EOF
+   <pre>
+   HEAD
 
       $con = sub{
          my $rv = More($handle);
@@ -962,11 +999,13 @@ how to wrap them:
               $_{Data} = $rv;
               return ($con);
          };
-         ();
+         <<TAIL;
+   </pre> thanks for playing </body></html>
+   TAIL
       }
    }
 
-And be sure to put C<'/startrestults/' => \&StartMoreWrapper> into the
+And be sure to put C<'/startresults' => \&StartMoreWrapper> into the
 functions hash.
 
 
@@ -1021,15 +1060,30 @@ Fixed a bug with serving files larger than the chunksize, that inserted
 a gratuitous newline.  Singlethreaded will now work to serve a minicpan
 mirror.
 
-=item 0.08 
+=item 0.08 March, 2008
 
 address of this end of the connection now available
+
+=item 0.10  June, 2008
+
+improved handling of callbacks
+
+improved association logic WRT trailing slashes
+
+repeated selects inside C<Serve()> while outputting
+
+only writing one byte at a time on Windows,
+where Cygwin's syswrite does not
+do partial writes. (patch welcome to improve this situation)
+
+less debugging output by default, and some informational prints
+changed to warnings (to get line number info)
 
 =back
 
 =head1 EXPORTS
 
-C<Serve()> is exported.
+C<Serve()> is exported, and must be called in a loop.
 
 =head1 AUTHOR
 

@@ -1,11 +1,11 @@
 --- #YAML:1.0
 name:                HTTP-Server-Singlethreaded
-version:             0.08
+version:             0.10
 abstract:            a framework for standalone web applications
 license:             ~
 author:              
     - David Nicol <davidnico@cpan.org>
-generated_by:        ExtUtils::MakeMaker version 6.42
+generated_by:        ExtUtils::MakeMaker version 6.44
 distribution_type:   module
 requires:     
 meta-spec:
