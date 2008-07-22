@@ -1,4 +1,4 @@
-HTTP/Server/Singlethreaded version 0.01
+HTTP/Server/Singlethreaded version 0.11
 ==================================
 A single-threaded HTTP server suitable for building
 stand-alone web applications around. On systems without
@@ -33,7 +33,7 @@ Alternately, just create a HTTP/Server directory under
 somwhere in your Perl installation's include path and
 copy Singlethreaded.pm there.
 
-You'll want to edit the module some to make it a
+You may want to edit the module some to make it a
 little less chatty to STDOUT.
 
 DEPENDENCIES
@@ -45,5 +45,5 @@ distributed with core Perl.
 COPYRIGHT AND LICENCE
 
 
-Copyright (C) 2004 David Nicol.  GPL/AL. 
+Copyright (C) 2004,2006,2008 David Nicol.  GPL/AL. 
 

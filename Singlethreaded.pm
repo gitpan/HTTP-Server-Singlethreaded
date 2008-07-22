@@ -43,7 +43,10 @@ $StaticBufferSize
 @Saddr
 /;
 
-sub DEBUG() {0};
+sub DEBUG() {
+#	1
+	0 
+};
 
 $RequestTally = 0;
 $StaticBufferSize ||= 50000;
@@ -59,13 +62,12 @@ my @outbuf;       # buffered information for writing to clients
 my @LargeFile;    # handles to large files being read, indexed by
                   # $fn of the client they are being read for
 my @continue;     # is there a continuation defined for this fn?
-my @poll;         # do we know how to poll a continuation for readiness?
 my @PostData;     # data for POST-style requests
 
 #lists of file numbers
 my @PollMe;       #continuation functions associated with empty output buffers
 
-$VERSION = '0.10';
+$VERSION = '0.11';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -103,7 +105,7 @@ sub makeref($){
 
 sub import(){
 
-  print __PACKAGE__," import called\n";
+  DEBUG and print __PACKAGE__," import called\n";
 
   shift; # we don't need to know __PACKAGE__
 
@@ -153,6 +155,9 @@ sub import(){
 
   @Listeners or die __PACKAGE__." could not bind any listening sockets among @Port";
 
+###########################################################################
+#   uncomment the following if so desired
+###########################################################################
 #   if($defined $uid){
 #      $> = $< = $uid
 #   };
@@ -173,6 +178,7 @@ sub import(){
 #      $forkwidth = "$i of $forkwidth";
 #   };
 #   END{ kill 'TERM', $_ for @kids };
+############################################################################
 
 
 
@@ -253,7 +259,7 @@ sub dispatch(){
 # and data in $Data
 
    if(DEBUG){
-     print "Request:\n${_}END_REQUEST\n";
+     print "Request on fn $fn:\n${_}END_REQUEST\n";
    };
 
    # defaults:
@@ -261,6 +267,8 @@ sub dispatch(){
        Data => undef,
        ResultCode => 200
    };
+
+   $continue[$fn] = undef;
 
    # rfc2616 section 5.1
    /^(\w+) (\S+) HTTP\/(\S+)\s*(.*)$CRLF$CRLF/s
@@ -410,7 +418,7 @@ EOF
 sub HandleRequest(){
    $RequestTally++;
    print "Handling request $RequestTally on fn $fn\n";
-   # print "Inbuf:\n$inbuf[$fn]\n";
+   DEBUG and warn "Inbuf:\n$inbuf[$fn]\n";
    *_ = \delete $inbuf[$fn]; # tight, huh? (the scalar slot)
    
    my $dispatchretval = dispatch;
@@ -421,29 +429,15 @@ Server: $ServerType
 EOF
    # *_ = $Moustache[$fn];  # also, the hash slot -- this is done in &dispatch, never mind
    HandleDRV($dispatchretval);
+   DEBUG and warn "Outbuf:\n$outbuf[$fn]\n";
 };
 sub HandleDRV{
-   our $PMflag;
    my $dispatchretval = shift;
    @_ and $dispatchretval = [$dispatchretval,shift]; # support old-style
-   $poll[$fn] = $continue[$fn] = undef;
+   $continue[$fn] = undef;
    length $_{Data} and $outbuf[$fn] .= $_{Data};
    if(ref($dispatchretval)){
-      $PMflag = 1;
-      my ($poll, $continue);
-      if(ref($dispatchretval) eq 'ARRAY'){
-         ($continue,$poll) = @{$dispatchretval}
-      }elsif(ref($dispatchretval) eq 'HASH'){
-         ($poll, $continue) = @{$dispatchretval}{qw/poll continue/}
-      }elsif(ref($dispatchretval) eq 'CODE'){
-	 $continue = $dispatchretval;
-      }else{
-         die "I do not understand what to do with <<$dispatchretval>> here";
-      }
-      ref($poll) eq 'CODE' and $poll[$fn] = $poll;
-      ref($continue) eq 'CODE' or die
-         die "I do not understand what to do with <<$continue>> here";
-      $continue[$fn] = $continue;
+      $continue[$fn] = $dispatchretval;
 
    }else{
 	$outbuf[$fn].=$dispatchretval
@@ -460,30 +454,19 @@ sub Serve(){
 BEGIN_SERVICE:
 
   # support for continuation coderefs to empty outbufs
-  {
-   my @PM;
-   our $PMflag;
-   for $fn (@PollMe){
-         warn "polling $fn";
-         if(
-           defined($continue[$fn])
-         ){
-           if (defined $poll[$fn]){
-              &{$poll[$fn]} or do {
-                  push @PM, $fn;
-                  next;
-              }
-           };
-           *_ = $Moustache[$fn]; # the hash slot 
+  @PollMe = grep {
+	 $fn = $_;
+         DEBUG and warn "polling $_";
+         if ( $continue[$_] ) {
+           *_ = $Moustache[$_]; # the hash slot 
+	   DEBUG and warn "still working with $_";
            $_{Data} = '';
-   	   HandleDRV( &{$continue[$fn]} );
-	   length $outbuf[$fn] or  push @PM, $fn;
+   	   HandleDRV( &{$continue[$_]} );
+	   $continue[$_];
          }
-   };
+  } @PollMe;
 
-   @PollMe = @PM;
 
-  };
 
    # poll for new connections?
    my $Accepting = ($client_tally < $MaxClients);
@@ -552,6 +535,8 @@ BEGIN_SERVICE:
 #BLAH         }else{  # WORKING NON_BLOCKING
           while ($paddr=accept(my $NewServer, $_)){
             $fn =fileno($NewServer); 
+	    $continue[$fn] = undef;
+	    $Moustache[$fn] = {};
             $inbuf[$fn] = $outbuf[$fn] = '';
 	    ($Cport[$fn], my $iaddr) = sockaddr_in($paddr);
 	    $Caddr[$fn] = inet_ntoa($iaddr);
@@ -603,12 +588,8 @@ BEGIN_SERVICE:
              };
          }elsif(
            # support for continuation coderefs
-           defined($continue[$fn])
+           $continue[$fn]
          ){
-           if (defined $poll[$fn] and !&{$poll[$fn]}){
-              length ($outbuf[$fn]) or push @PollMe, $fn;
-              next;
-           };
            *_ = $Moustache[$fn]; # the hash slot 
            $_{Data} = '';
    	   HandleDRV( &{$continue[$fn]} );
@@ -847,7 +828,7 @@ web page viewers possible. Depending on how long your functions take.
 an e-mail address for whoever is responsible for this server,
 for use in error messages.
 
-=head2 $forkwidth
+=head2 $forkwidth  ( commented out by default )
 
 Set $forkwidth to a number greater than 1
 to have singlethreaded fork after binding. If running on a
@@ -932,14 +913,15 @@ least with the default configuration.
 Store your complete web page output into C<$_{Data}>, just as you
 would write output starting with server headers when writing
 a simple CGI program. Or leave $_{Data} alone and return a valid
-page, beginning with headers.
+page, beginning with headers.  When returning a continuation coderef
+and data both, the data must be stored in  C<$_{Data}>.
 
 =head1 AVOIDING DEADLOCKS
 
 The server blocks while reading files and executing functions.  You may use a closure
 to describe a callback.  %_ is restored between callbacks while handling a request.
 
-=head1 CALLBACK FUNCTIONS (and poll functions)
+=head1 CALLBACK FUNCTIONS 
 
 Instead of a string to send to the client, the function 
 returns a coderef to indicate
@@ -947,31 +929,10 @@ that Singlethreaded needs to check back later to see if the page
 is ready, by running the coderef, next time around.  Data for
 the client, if any, must be stored in C<$_{Data}> when you want
 the callback to be called again (indicated by continuing to return
-the callback function.)
+a coderef.)
 
 When the callback function returns a non-reference, that string is
 considered the end of the response.
-
-Instead of a coderef, a hashref or an arrayref is acceptable.
-The hashref needs to have 'continue' defined within it as a coderef.,
-and may have 'poll' defined in it when it makes sense to have 
-separate poll and continue coderefs.
-
-=head3 poll
-
-a reference to code that will return a boolean indicating true when it is time
-to run the continue piece and get some data, or false when we should wait
-some more before running the continuation.
-
-=head3 continue
-
-a coderef that, when run, will set $_{Data} with an empty or non-empty
-string, and return a (contine, [poll]) list. 
-
-=head2 an arrayref instead of a hashref
-
-in the order of, C<[$continue, $poll]> so the later one
-can be left out if there is no poll code.
 
 =head2 example
 
@@ -984,7 +945,6 @@ how to wrap them:
 
    sub StartMoreWrapper{
       my $handle = Start or die "Start() failed";
-      my $con;
       $_{Data} = <<HEAD;
    Content-type: text/html
 
@@ -993,7 +953,7 @@ how to wrap them:
    <pre>
    HEAD
 
-      $con = sub{
+      my $continue_coderef = sub{
          my $rv = More($handle);
          if(defined $rv){
               $_{Data} = $rv;
@@ -1017,6 +977,8 @@ leveraging a single persistent DBI handle into an unlimited number
 of simultaneous HTTP requests.  
 
 It will work to serve a mini-cpan repository.
+
+It has been used to create a JSON message-passing hub.
 
 =head1 HISTORY
 
@@ -1079,6 +1041,16 @@ do partial writes. (patch welcome to improve this situation)
 less debugging output by default, and some informational prints
 changed to warnings (to get line number info)
 
+=item 0.11  July, 2008
+
+removed "poll" functions, which were redundant with "continue" functions.  Any
+reference returned from a function is now presumed to be a coderef.  This will
+break any installed code that used the "poll" feature or returned the continue
+coderef in a hashref or arrayref as previously allowed.
+
+There was a serious problem preventing continuation systems from working right,
+so I doubt anyone was using those features.
+
 =back
 
 =head1 EXPORTS
@@ -1101,4 +1073,7 @@ the University of Missouri - Kansas City Task Definition Interface
 
 perlmonks
 
+TipJar LLC chat hub system (http://tipjar.com/nettoys/bathtub.html)
+
 =cut
+
