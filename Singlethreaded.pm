@@ -67,7 +67,7 @@ my @PostData;     # data for POST-style requests
 #lists of file numbers
 my @PollMe;       #continuation functions associated with empty output buffers
 
-$VERSION = '0.11';
+$VERSION = '0.12';
 
 # default values:
 $ServerType ||= __PACKAGE__." $VERSION (Perl $])";
@@ -84,15 +84,15 @@ sub Serve();
 use Socket  qw(:DEFAULT :crlf);
 BEGIN{
 	use Fcntl;
-        # determine if O_NONBLOCK works
+        # determine if O_NONBLOCK is available,
         # for use in fcntl($l, F_SETFL, O_NONBLOCK) 
         eval{
           # print "O_NONBLOCK is ",O_NONBLOCK,
           #      " and F_SETFL is ",F_SETFL,"\n";
-          O_NONBLOCK; F_SETFL;
+          no warnings; O_NONBLOCK; F_SETFL;
         };
         if ($@){
-           # print "O_NONBLOCK is broken, but a workaround is in place.\n";
+           warn "O_NONBLOCK is broken, but a workaround is in place.\n";
 	   eval'sub BROKEN_NONBLOCKING(){1}';
         }else{
 	   eval'sub BROKEN_NONBLOCKING(){0}';
@@ -426,6 +426,7 @@ sub HandleRequest(){
    $outbuf[$fn]=<<EOF;  # change to .= if/when we support pipelining
 HTTP/1.1 $_{ResultCode} $RCtext{$_{ResultCode}}
 Server: $ServerType
+Connection: close
 EOF
    # *_ = $Moustache[$fn];  # also, the hash slot -- this is done in &dispatch, never mind
    HandleDRV($dispatchretval);
@@ -435,7 +436,7 @@ sub HandleDRV{
    my $dispatchretval = shift;
    @_ and $dispatchretval = [$dispatchretval,shift]; # support old-style
    $continue[$fn] = undef;
-   length $_{Data} and $outbuf[$fn] .= $_{Data};
+   { no warnings; length $_{Data} and $outbuf[$fn] .= $_{Data}; }
    if(ref($dispatchretval)){
       $continue[$fn] = $dispatchretval;
 
@@ -1050,6 +1051,13 @@ coderef in a hashref or arrayref as previously allowed.
 
 There was a serious problem preventing continuation systems from working right,
 so I doubt anyone was using those features.
+
+=item 0.12  July, 2009
+
+silenced a warning about C<$_{Data}> being uninitialized
+
+instead of actually implementing keep-alive, added a "Connection: close" header
+line at the beginning of each response
 
 =back
 
